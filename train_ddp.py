@@ -403,6 +403,7 @@ def parse_args():
     parser.add_argument('--wandb_project', type=str, default='sentence-embeddings-training', help='WandB project name')
     parser.add_argument('--wandb_api_key', type=str, required=True, help='WandB API Key')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of DataLoader workers')
+    parser.add_argument('--logging_steps', type=int, default=100, help='Number of logging steps')
     return parser.parse_args()
 
 if __name__ == "__main__":
