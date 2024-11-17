@@ -339,8 +339,8 @@ def main_worker(rank, world_size, args):
     )
 
     # Create samplers
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True,collate_fn = None)
-    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False,collate_fn = None)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
 
     # Create dataloaders
     train_dataloader = DataLoader(
