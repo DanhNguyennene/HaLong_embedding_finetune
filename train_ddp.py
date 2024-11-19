@@ -1,4 +1,3 @@
-
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -190,10 +189,70 @@ def setup(rank, world_size):
 
 def cleanup():
     torch.distributed.destroy_process_group()
+def generate_neighbor_samples(q, pos_c, all_contexts, num_negatives):
+    """Generate samples using neighboring contexts"""
+    samples = []
+    # Add positive sample
+    samples.append((q, pos_c, 1))
+    
+    # Find index of positive context
+    pos_index = all_contexts.index(pos_c)
+    
+    # Generate negative samples from neighboring contexts
+    added_negatives = 0
+    for offset in range(1, len(all_contexts)):
+        # Check left neighbor
+        left_index = pos_index - offset
+        if left_index >= 0 and added_negatives < num_negatives:
+            samples.append((q, all_contexts[left_index], 0))
+            added_negatives += 1
+        
+        # Check right neighbor
+        right_index = pos_index + offset
+        if right_index < len(all_contexts) and added_negatives < num_negatives:
+            samples.append((q, all_contexts[right_index], 0))
+            added_negatives += 1
+        
+        # Stop if we've added enough negative samples
+        if added_negatives >= num_negatives:
+            break
+    
+    return samples
+
+def generate_samples_parallel(questions, positive_contexts, all_contexts, num_negatives, n_jobs=-1):
+    """Generate samples in parallel with progress bar"""
+    # Use all available cores if n_jobs is -1
+    if n_jobs == -1:
+        n_jobs = mp.cpu_count()
+    
+    # Create a pool of workers
+    with mp.Pool(processes=n_jobs) as pool:
+        # Prepare arguments for parallel processing
+        args = [(q, pos_c, all_contexts, num_negatives) 
+                for q, pos_c in zip(questions, positive_contexts)]
+        
+        # Use tqdm to show progress
+        results = list(tqdm(
+            pool.starmap(generate_neighbor_samples, args), 
+            total=len(questions), 
+            desc="Generating Samples"
+        ))
+    
+    # Flatten results and separate into lists
+    questions_list = []
+    contexts_list = []
+    labels_list = []
+    
+    for sample_group in results:
+        for q, c, label in sample_group:
+            questions_list.append(q)
+            contexts_list.append(c)
+            labels_list.append(label)
+            
+    return np.array(questions_list), np.array(contexts_list), np.array(labels_list)
 def main_worker(rank, world_size, args):
     try:
         setup(rank, world_size)
-
         if rank == 0:
             os.environ["WANDB_API_KEY"] = args.wandb_api_key
             wandb.init(project=args.wandb_project)
@@ -204,45 +263,30 @@ def main_worker(rank, world_size, args):
             print(f"Batch size per GPU: {args.batch_size}")
             print(f"Learning rate: {args.learning_rate}")
 
-        # Rest of the main_worker code remains the same...
         # Set seeds for reproducibility
-        print("Seeding")
         torch.manual_seed(args.random_seed)
         np.random.seed(args.random_seed)
         torch.cuda.manual_seed_all(args.random_seed)  
-        print("seeded")
+
         # Load data
         df = pd.read_csv(args.data_path)
         questions = df['question'].tolist()
         positive_contexts = df['context'].tolist()
         all_contexts = df['context'].unique().tolist()
-        print("Data Loaded")
-        # Create negative samples
-        # For each question, pair it with one positive context and multiple negative contexts
-        # This will transform the data into a classification format
+        print(f"Data Loaded: {len(questions)} questions, {len(all_contexts)} unique contexts")
 
-        # Parameters
-        num_negatives = args.num_negatives
+        # Determine number of jobs (leave one core free)
+        n_jobs = max(1, joblib.cpu_count() - 1)
+        print(f"Using {n_jobs} CPU cores for parallel processing")
 
-        questions_list = []
-        contexts_list = []
-        labels_list = []
-
-        for q, pos_c in zip(questions, positive_contexts):
-            # Positive sample
-            questions_list.append(q)
-            contexts_list.append(pos_c)
-            labels_list.append(1)  # Positive label
-
-            # Negative samples
-            neg_contexts = np.random.choice([c for c in all_contexts if c != pos_c], size=num_negatives, replace=False)
-            for neg_c in neg_contexts:
-                questions_list.append(q)
-                contexts_list.append(neg_c)
-                labels_list.append(0)  # Negative label
-        print("Samples generated")
-
-        # Split data
+        # Generate samples in parallel
+        questions_list, contexts_list, labels_list = generate_samples_parallel(
+            questions, 
+            positive_contexts, 
+            all_contexts, 
+            args.num_negatives,
+            n_jobs
+        )
         train_questions, val_questions, train_contexts, val_contexts, train_labels, val_labels = train_test_split(
             questions_list,
             contexts_list,
