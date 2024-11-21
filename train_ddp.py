@@ -14,30 +14,78 @@ import logging
 import wandb
 import os
 import argparse
-
+import joblib
+import multiprocessing as mp
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("embedding_trainer")
-class TripletLoss(nn.Module):
-    def __init__(self, margin=1.0):
-        super().__init__()
-        self.margin = margin
+class ClassificationDataset(Dataset):
+    """
+    A custom Dataset class for classification using Cross Entropy Loss.
+    Each sample consists of a question, a context, and a label indicating
+    whether the context is positive (1) or negative (0) for the question.
+    """
+    def __init__(self, questions, contexts, labels, tokenizer, max_length=512):
+        self.questions = questions
+        self.contexts = contexts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_length = max_length
 
-    def forward(self, anchor, positive, negative):
-        distance_positive = torch.sum((anchor - positive) ** 2, dim=1)
-        distance_negative = torch.sum((anchor - negative) ** 2, dim=1)
-        losses = torch.relu(distance_positive - distance_negative + self.margin)
+    def __len__(self):
+        return len(self.questions)
+
+    def __getitem__(self, idx):
+        question = self.questions[idx]
+        context = self.contexts[idx]
+        label = self.labels[idx]
+
+        encoding = self.tokenizer(
+            question,
+            context,
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+
+        return {
+            'input_ids': encoding['input_ids'].squeeze(0),  # Remove batch dimension
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
+
+class SentenceEmbeddingModel(nn.Module):
+    def __init__(self, model_name, pooling_strategy='cls'):
+        super().__init__()
+        self.encoder = AutoModel.from_pretrained(model_name)
+        self.pooling_strategy = pooling_strategy
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         
-        # Debug first sample in batch
-        if torch.distributed.get_rank() == 0:
-            with torch.no_grad():
-                pos_dist = distance_positive[0].item()
-                neg_dist = distance_negative[0].item()
-                loss_val = losses[0].item()
-                print(f"\n[Sample Distances] Pos: {pos_dist:.4f}, Neg: {neg_dist:.4f}, Loss: {loss_val:.4f}")
+        if self.pooling_strategy == 'cls':
+            embeddings = outputs.last_hidden_state[:, 0, :]
+        elif self.pooling_strategy == 'mean':
+            token_embeddings = outputs.last_hidden_state
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+            sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+            embeddings = sum_embeddings / sum_mask
         
-        return losses.mean()
+        # Normalize embeddings
+        return F.normalize(embeddings, p=2, dim=1)
 
 class EmbeddingTrainer:
+    def __init__(self, model_name, device, pooling_strategy='cls', embedding_dim=768):
+        self.device = device
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = SentenceEmbeddingModel(model_name, pooling_strategy).to(device)
+        self.loss_fn = nn.CrossEntropyLoss().to(device)  # Changed to CrossEntropyLoss
+        self.optimizer = None  # Will be initialized after DDP wrapper
+        self.scheduler = None
+        self.best_val_loss = float('inf')
+        self.classifier = None  # Initialize classifier later
+
     def train(self, train_dataloader, val_dataloader, 
               num_epochs=3, 
               learning_rate=2e-5,
@@ -45,9 +93,15 @@ class EmbeddingTrainer:
               logging_steps=100,
               rank=0):
               
+        # Initialize optimizer after DDP wrapper
         if self.optimizer is None:
-            self.optimizer = AdamW(self.model.parameters(), lr=learning_rate)
+            # Include classifier parameters if classifier exists
+            if self.classifier:
+                self.optimizer = AdamW(list(self.model.parameters()) + list(self.classifier.parameters()), lr=learning_rate)
+            else:
+                self.optimizer = AdamW(self.model.parameters(), lr=learning_rate)
                 
+        # Initialize scheduler
         total_steps = len(train_dataloader) * num_epochs
         self.scheduler = get_linear_schedule_with_warmup(
             self.optimizer, 
@@ -56,83 +110,88 @@ class EmbeddingTrainer:
         )
 
         for epoch in range(num_epochs):
-            train_dataloader.sampler.set_epoch(epoch)
+            train_dataloader.sampler.set_epoch(epoch)  # Important for DDP
             
             if rank == 0:
-                print(f"\n{'='*20} Epoch {epoch + 1}/{num_epochs} {'='*20}")
+                logger.info(f"Starting epoch {epoch + 1}/{num_epochs}")
             
             self.model.train()
+            if self.classifier:
+                self.classifier.train()
             epoch_train_loss = 0
             progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}", disable=(rank != 0))
 
             for step, batch in enumerate(progress_bar):
                 try:
-                    # Get embeddings
-                    anchor_emb = self.compute_embeddings(batch, 'anchor')
-                    positive_emb = self.compute_embeddings(batch, 'positive')
-                    negative_emb = self.compute_embeddings(batch, 'negative')
+                    # Move all tensors to device
+                    input_ids = batch['input_ids'].to(self.device)
+                    attention_mask = batch['attention_mask'].to(self.device)
+                    labels = batch['labels'].to(self.device)
 
-                    # Print embedding norms occasionally
-                    if rank == 0 and step % logging_steps == 0:
-                        print(f"\n[Step {step} Norms]")
-                        print(f"Anchor: {torch.norm(anchor_emb[0]).item():.4f}")
-                        print(f"Positive: {torch.norm(positive_emb[0]).item():.4f}")
-                        print(f"Negative: {torch.norm(negative_emb[0]).item():.4f}")
+                    # Forward pass
+                    embeddings = self.model(input_ids, attention_mask)
+
+                    # Initialize classifier if not already
+                    if self.classifier is None:
+                        self.classifier = nn.Linear(embeddings.size(-1), 2).to(self.device)
+                        # Wrap classifier with DDP
+                        self.classifier = DDP(
+                            self.classifier,
+                            device_ids=[self.device.index],
+                            output_device=self.device.index
+                        )
+                        # Update optimizer to include classifier parameters
+                        self.optimizer = AdamW(list(self.model.parameters()) + list(self.classifier.parameters()), lr=learning_rate)
+
+                    # Compute logits
+                    logits = self.classifier(embeddings)  # Shape: (batch_size, 2)
 
                     # Compute loss
-                    loss = self.loss_fn(anchor_emb, positive_emb, negative_emb)
+                    loss = self.loss_fn(logits, labels)
 
                     # Backward pass
                     loss.backward()
+                    
+                    # Gradient clipping
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
                     self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad()
 
                     epoch_train_loss += loss.item()
 
-                    # Print similarities and update progress
-                    if rank == 0 and step % logging_steps == 0:
-                        with torch.no_grad():
-                            pos_sim = F.cosine_similarity(
-                                anchor_emb[0:1], positive_emb[0:1]
-                            ).item()
-                            neg_sim = F.cosine_similarity(
-                                anchor_emb[0:1], negative_emb[0:1]
-                            ).item()
-                            print(f"[Similarities] Pos: {pos_sim:.4f}, Neg: {neg_sim:.4f}")
-                            print(f"Current loss: {loss.item():.4f}")
-                            print(f"Learning rate: {self.scheduler.get_last_lr()[0]:.2e}")
+                    if rank == 0:
+                        progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
 
-                        wandb.log({
-                            'epoch': epoch + 1,
-                            'step': step,
-                            'train_loss': loss.item(),
-                            'learning_rate': self.scheduler.get_last_lr()[0],
-                            'positive_similarity': pos_sim,
-                            'negative_similarity': neg_sim
-                        })
-
-                    progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
+                        if step % logging_steps == 0:
+                            wandb.log({
+                                'epoch': epoch + 1,
+                                'step': step,
+                                'train_loss': loss.item(),
+                                'learning_rate': self.scheduler.get_last_lr()[0],
+                            })
 
                 except Exception as e:
-                    print(f"Error in training step: {str(e)}")
+                    logger.error(f"Error in training step: {str(e)}")
                     continue
 
             avg_train_loss = epoch_train_loss / len(train_dataloader)
             
             if rank == 0:
-                print(f"\n{'='*20} Epoch {epoch + 1} Summary {'='*20}")
-                print(f"Average training loss: {avg_train_loss:.4f}")
+                logger.info(f"Average training loss: {avg_train_loss:.4f}")
                 
+                # Validation
                 val_loss = self.evaluate(val_dataloader)
-                print(f"Validation loss: {val_loss:.4f}")
+                logger.info(f"Validation loss: {val_loss:.4f}")
 
+                # Save best model
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     self.save_model("best_model")
-                    print("\n★ New best model saved! ★")
+                    logger.info("Best model saved.")
 
+                # Log epoch metrics
                 wandb.log({
                     'epoch': epoch + 1,
                     'avg_train_loss': avg_train_loss,
@@ -142,37 +201,53 @@ class EmbeddingTrainer:
     @torch.no_grad()
     def evaluate(self, dataloader, rank=0):
         self.model.eval()
+        if self.classifier:
+            self.classifier.eval()
         total_loss = 0
-        all_pos_sims = []
-        all_neg_sims = []
         
         for batch in tqdm(dataloader, desc="Evaluating", disable=(rank != 0)):
             try:
-                anchor_emb = self.compute_embeddings(batch, 'anchor')
-                positive_emb = self.compute_embeddings(batch, 'positive')
-                negative_emb = self.compute_embeddings(batch, 'negative')
+                # Move all tensors to device
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                labels = batch['labels'].to(self.device)
 
-                # Calculate similarities for statistics
-                pos_sims = F.cosine_similarity(anchor_emb, positive_emb)
-                neg_sims = F.cosine_similarity(anchor_emb, negative_emb)
-                all_pos_sims.extend(pos_sims.cpu().tolist())
-                all_neg_sims.extend(neg_sims.cpu().tolist())
+                # Forward pass
+                embeddings = self.model(input_ids, attention_mask)
 
-                loss = self.loss_fn(anchor_emb, positive_emb, negative_emb)
+                # Compute logits
+                if self.classifier is None:
+                    self.classifier = nn.Linear(embeddings.size(-1), 2).to(self.device)
+                    self.classifier = DDP(
+                        self.classifier,
+                        device_ids=[self.device.index],
+                        output_device=self.device.index
+                    )
+                logits = self.classifier(embeddings)  # Shape: (batch_size, 2)
+
+                # Compute loss
+                loss = self.loss_fn(logits, labels)
+                
                 total_loss += loss.item()
 
             except Exception as e:
-                print(f"Error in evaluation step: {str(e)}")
+                logger.error(f"Error in evaluation step: {str(e)}")
                 continue
 
-        if rank == 0:
-            print("\n=== Validation Statistics ===")
-            print(f"Average positive similarity: {np.mean(all_pos_sims):.4f}")
-            print(f"Average negative similarity: {np.mean(all_neg_sims):.4f}")
-            print(f"Positive similarity range: [{min(all_pos_sims):.4f}, {max(all_pos_sims):.4f}]")
-            print(f"Negative similarity range: [{min(all_neg_sims):.4f}, {max(all_neg_sims):.4f}]")
-
         return total_loss / len(dataloader)
+
+    def save_model(self, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        # Save the underlying model, not the DDP wrapper
+        model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
+        model_to_save.encoder.save_pretrained(output_dir)
+        self.tokenizer.save_pretrained(output_dir)
+        # Save the classifier if it exists
+        if self.classifier:
+            # Save only the underlying classifier module
+            classifier_to_save = self.classifier.module if hasattr(self.classifier, 'module') else self.classifier
+            torch.save(classifier_to_save.state_dict(), os.path.join(output_dir, 'classifier.pt'))
+        logger.info(f"Model saved to {output_dir}")
 def setup(rank, world_size):
     # Removed environment variable settings from here
     # They will be set in the main process
@@ -189,67 +264,78 @@ def setup(rank, world_size):
 
 def cleanup():
     torch.distributed.destroy_process_group()
+import numpy as np
+import multiprocessing as mp
+from tqdm import tqdm
+
 def generate_neighbor_samples(q, pos_c, all_contexts, num_negatives):
-    """Generate samples using neighboring contexts"""
-    samples = []
-    # Add positive sample
-    samples.append((q, pos_c, 1))
+    samples = [(q, pos_c, 1)]  # Positive sample
     
-    # Find index of positive context
     pos_index = all_contexts.index(pos_c)
-    
-    # Generate negative samples from neighboring contexts
     added_negatives = 0
-    for offset in range(1, len(all_contexts)):
-        # Check left neighbor
-        left_index = pos_index - offset
-        if left_index >= 0 and added_negatives < num_negatives:
-            samples.append((q, all_contexts[left_index], 0))
+    
+    left_offset = right_offset = 1
+    
+    while added_negatives < num_negatives:
+        # Try left side
+        if pos_index - left_offset >= 0 and added_negatives < num_negatives:
+            samples.append((q, all_contexts[pos_index - left_offset], 0))
             added_negatives += 1
+            left_offset += 1
         
-        # Check right neighbor
-        right_index = pos_index + offset
-        if right_index < len(all_contexts) and added_negatives < num_negatives:
-            samples.append((q, all_contexts[right_index], 0))
+        # Try right side
+        if pos_index + right_offset < len(all_contexts) and added_negatives < num_negatives:
+            samples.append((q, all_contexts[pos_index + right_offset], 0))
             added_negatives += 1
+            right_offset += 1
         
-        # Stop if we've added enough negative samples
-        if added_negatives >= num_negatives:
+        # Prevent infinite loop
+        if left_offset + right_offset > len(all_contexts):
             break
     
     return samples
 
 def generate_samples_parallel(questions, positive_contexts, all_contexts, num_negatives, n_jobs=-1):
-    """Generate samples in parallel with progress bar"""
     # Use all available cores if n_jobs is -1
     if n_jobs == -1:
         n_jobs = mp.cpu_count()
     
-    # Create a pool of workers
-    with mp.Pool(processes=n_jobs) as pool:
-        # Prepare arguments for parallel processing
-        args = [(q, pos_c, all_contexts, num_negatives) 
-                for q, pos_c in zip(questions, positive_contexts)]
-        
-        # Use tqdm to show progress
-        results = list(tqdm(
-            pool.starmap(generate_neighbor_samples, args), 
-            total=len(questions), 
-            desc="Generating Samples"
-        ))
-    
-    # Flatten results and separate into lists
-    questions_list = []
-    contexts_list = []
-    labels_list = []
-    
-    for sample_group in results:
-        for q, c, label in sample_group:
-            questions_list.append(q)
-            contexts_list.append(c)
-            labels_list.append(label)
+    try:
+        # Create a pool of workers
+        with mp.Pool(processes=n_jobs) as pool:
+            # Prepare arguments for parallel processing
+            args = [(q, pos_c, all_contexts, num_negatives) 
+                    for q, pos_c in zip(questions, positive_contexts)]
             
-    return np.array(questions_list), np.array(contexts_list), np.array(labels_list)
+            # Use tqdm to show progress
+            results = list(tqdm(
+                pool.starmap(generate_neighbor_samples, args), 
+                total=len(questions), 
+                desc="Generating Samples"
+            ))
+        
+        # Flatten results and separate into lists
+        questions_list = []
+        contexts_list = []
+        labels_list = []
+        
+        for sample_group in results:
+            for q, c, label in sample_group:
+                questions_list.append(q)
+                contexts_list.append(c)
+                labels_list.append(label)
+        
+        # Convert to numpy arrays and release memory
+        return (
+            np.array(questions_list, dtype=object), 
+            np.array(contexts_list, dtype=object), 
+            np.array(labels_list, dtype=np.int8)
+        )
+    
+    finally:
+        # Explicitly release memory
+        import gc
+        gc.collect()
 def main_worker(rank, world_size, args):
     try:
         setup(rank, world_size)
@@ -292,8 +378,7 @@ def main_worker(rank, world_size, args):
             contexts_list,
             labels_list,
             test_size=args.train_test_split,
-            random_state=args.random_seed,
-            stratify=labels_list
+            random_state=args.random_seed
         )
         print("Data splitted")
 
@@ -471,3 +556,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Error in main process: {str(e)}")
         raise e
+
